@@ -215,12 +215,49 @@ present from input through to output.
 
 ### 4.4 Head ablation (P5)
 
-(See `paper/figures/06_head_ablation_d1.png`. Ablation results when
-head ablation completes — TBD on first draft.)
+![Per-head probe-accuracy delta after ablation, D1](figures/06_head_ablation_d1.png)
 
-The smoke-test (n=5) hinted at layer-0 attention heads
-disproportionately driving the dialect probe. The full N=30 run
-gives the per-head heatmap.
+Each (layer, head) cell is the change in 5-fold CV linear probe
+accuracy on D1 (BM↔NN at the final-layer mean-pooled residual,
+n=30) after zeroing that head's contribution to its layer's `o_proj`.
+Baseline (no ablation) probe accuracy at n=30 is 0.617 — lower than
+the n=200 linear probe in §4.3 (~0.80) because of smaller test
+folds, but the relative-effect signal is what matters here.
+
+Top-5 heads where ablation hurts the dialect probe most:
+
+| Layer | Head | Δ probe accuracy |
+|------:|-----:|----------------:|
+| 0  | 1 | -0.067 |
+| 22 | 6 | -0.067 |
+| 0  | 3 | -0.050 |
+| 1  | 5 | -0.033 |
+| 5  | 4 | -0.017 |
+
+**Read.** The biggest single-head ablation drops the dialect probe
+by ~6.7 percentage points on a 0.617 baseline. That's small. There
+is no single "dialect head"; ablating any one head leaves most of
+the signal intact. This is consistent with the linear-probe finding
+in §4.3 (flat 0.77-0.82 accuracy across all 28 layers): the
+dialect direction is **distributed**, not localized.
+
+Two qualitative observations on the top-5: (a) layer-0 heads
+disproportionately matter (3 of 5 are in layers 0-1), which fits a
+"surface-form dialect signal lives early" intuition since BM and
+NN differ mostly on tokenization-level features (`er` vs `er`, `et`
+vs `eit`, etc.). (b) The single late-stack hit, L22H6, is the only
+deep head that materially carries dialect — possibly the readout
+adapter that maps the persisted dialect direction toward the output.
+This is hypothesis-only; we'd need a causal patching experiment
+(activation patching from BM to NN at L22H6 specifically) to claim
+function.
+
+**Negative result for H2.** Sparse, localized "dialect-carrying
+heads" was the H2 sub-hypothesis. The data don't support it at this
+model size. The H2-vs-H2-alt entanglement question (whether
+dialect-carrying heads are a strict subset of foreign-language-
+carrying heads) is therefore moot at the head-granularity in this
+model: there is no concentrated "dialect head set" to compare against.
 
 ### 4.5 SAE (stretch)
 
@@ -252,9 +289,22 @@ That reframes the entanglement question (H2). At the granularity of
 this paper's probes, dialect signal and foreign-language signal are
 **clearly separated by magnitude**: D2 is perfectly separable
 (prob = 1.0) while D1 sits at 0.80. They're not on the same scale.
-Whether they share specific heads or live in disjoint subsets is
-the natural follow-up — the head ablation result (§4.4) is the first
-look at that.
+The head-ablation result (§4.4) makes the H2-vs-H2-alt comparison
+moot at head granularity in this model: there is no concentrated
+"dialect head set" to align or oppose against the
+foreign-language head set. The dialect direction is distributed
+across the residual stream, not carried by a sparse subset of heads.
+
+That itself is a finding worth stating clearly: in off-the-shelf
+Qwen 2.5 1.5B, dialect (BM/NN) is a smeared, low-magnitude
+geometric direction; foreign language (NB/EN) is a sharp,
+high-magnitude direction. Head ablation does not reveal a small
+mechanistic locus for the former. The natural mech-interp follow-up
+is **activation patching** — surgically replacing one position's
+activation between paired BM and NN inputs and measuring how far
+behavior shifts — which would reveal which positions in the
+residual stream are causally relevant, even when no individual
+head dominates.
 
 ## 6. Limitations
 
