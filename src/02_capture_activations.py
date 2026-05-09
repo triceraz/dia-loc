@@ -80,27 +80,48 @@ def _resolve_dtype(name: str) -> torch.dtype:
     return table[name]
 
 
+POOL_MODES = ("mean", "last")
+
+
 def _pool_layer_outputs(
     layer_outputs: dict[int, torch.Tensor],
     attention_mask: torch.Tensor,
+    mode: str,
 ) -> torch.Tensor:
-    """Mean-pool each layer's [batch, seq, d] tensor over non-pad tokens.
+    """Reduce each layer's [batch, seq, d] tensor to [batch, d] per `mode`.
 
-    Returns shape [batch, n_layers, d] in fp16. Mask comes from the
-    tokenizer (1 = real token, 0 = pad) so the pooled vector reflects
-    only real content.
+    Returns shape [batch, n_layers, d] in fp16.
+
+    Modes:
+      mean: mean over real (non-pad) token positions. Sentence-level
+            summary; what 03 (cosine + CKA) wants.
+      last: residual at the last real token position. The autoregressive
+            "next-token prediction" anchor; what 04 (logit lens) needs
+            to make sense.
     """
-    n_layers = len(layer_outputs)
-    # CPU tensors, since the hooks moved them off-GPU.
-    mask = attention_mask.to(torch.float32).unsqueeze(-1)  # [B, S, 1]
-    mask_sum = mask.sum(dim=1).clamp(min=1.0)  # [B, 1] avoids div-by-zero
+    if mode not in POOL_MODES:
+        raise ValueError(f"unknown pool mode: {mode}; expected {POOL_MODES}")
 
+    n_layers = len(layer_outputs)
     pooled_per_layer: list[torch.Tensor] = []
-    for li in range(n_layers):
-        h = layer_outputs[li].to(torch.float32)  # [B, S, d]
-        pooled = (h * mask).sum(dim=1) / mask_sum  # [B, d]
-        pooled_per_layer.append(pooled)
-    # Stack along a new layer axis -> [B, L, d]
+
+    if mode == "mean":
+        mask = attention_mask.to(torch.float32).unsqueeze(-1)  # [B, S, 1]
+        mask_sum = mask.sum(dim=1).clamp(min=1.0)
+        for li in range(n_layers):
+            h = layer_outputs[li].to(torch.float32)  # [B, S, d]
+            pooled_per_layer.append((h * mask).sum(dim=1) / mask_sum)  # [B, d]
+    else:  # "last"
+        # Index of the last real token per row. attention_mask has 1's
+        # for real tokens and 0's for pad; argmax-from-the-right gives
+        # us the last 1.
+        last_idx = attention_mask.long().sum(dim=1) - 1  # [B]
+        for li in range(n_layers):
+            h = layer_outputs[li].to(torch.float32)  # [B, S, d]
+            # Gather along the seq axis using last_idx per batch row.
+            batch_idx = torch.arange(h.shape[0], device=h.device)
+            pooled_per_layer.append(h[batch_idx, last_idx])  # [B, d]
+
     return torch.stack(pooled_per_layer, dim=1).to(torch.float16)
 
 
@@ -110,14 +131,15 @@ def capture_one_side(
     tokenizer,
     texts: list[str],
     device: str,
-) -> torch.Tensor:
-    """Run all `texts` through the model, capture mean-pooled residuals.
+    pool_modes: list[str],
+) -> dict[str, torch.Tensor]:
+    """Run all `texts` through the model, capture pooled residuals.
 
-    Returns a single tensor of shape [n_texts, n_layers, d_model] in fp16
-    on CPU.
+    Returns a dict mapping each pool mode to a tensor of shape
+    [n_texts, n_layers, d_model] in fp16 on CPU.
     """
     n_layers = num_layers(model)
-    pooled_rows: list[torch.Tensor] = []
+    rows_per_mode: dict[str, list[torch.Tensor]] = {m: [] for m in pool_modes}
 
     for text in tqdm(texts, desc="forward", leave=False):
         enc = tokenizer(
@@ -139,13 +161,14 @@ def capture_one_side(
                 f"hook captured {len(out)} layers, expected {n_layers}"
             )
 
-        # Pool on CPU using the cpu-offloaded activations from the hook.
-        pooled = _pool_layer_outputs(out, attention_mask.to("cpu"))  # [1, L, d]
-        pooled_rows.append(pooled)
+        # Hooks already CPU-offloaded the activations; mask must be on CPU
+        # too so the index/multiply happens against the same device.
+        cpu_mask = attention_mask.to("cpu")
+        for mode in pool_modes:
+            pooled = _pool_layer_outputs(out, cpu_mask, mode)  # [1, L, d]
+            rows_per_mode[mode].append(pooled)
 
-    # Concatenate along the batch axis. Each row is [1, L, d]; stacking
-    # gives [n_texts, L, d].
-    return torch.cat(pooled_rows, dim=0)
+    return {m: torch.cat(rows, dim=0) for m, rows in rows_per_mode.items()}
 
 
 def main() -> None:
@@ -170,12 +193,26 @@ def main() -> None:
             "to existing activations without re-doing the others."
         ),
     )
+    parser.add_argument(
+        "--pool",
+        default="mean,last",
+        help=(
+            "Comma-separated pooling modes. 'mean' (sentence summary; for "
+            "cosine+CKA), 'last' (last real token; for logit lens). Default "
+            "captures both since the marginal cost is tiny."
+        ),
+    )
     args = parser.parse_args()
 
     if args.contrasts:
         wanted = {s.strip() for s in args.contrasts.split(",") if s.strip()}
     else:
         wanted = None
+
+    pool_modes = [m.strip() for m in args.pool.split(",") if m.strip()]
+    for m in pool_modes:
+        if m not in POOL_MODES:
+            sys.exit(f"unknown pool mode: {m}; expected {POOL_MODES}")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _resolve_dtype(DTYPE_NAME)
@@ -252,17 +289,32 @@ def main() -> None:
         texts_a = [p["text_a"] for p in pairs]
         texts_b = [p["text_b"] for p in pairs]
 
-        print(f"[02] {slug} ({label}): {len(pairs)} pairs")
+        print(
+            f"[02] {slug} ({label}): {len(pairs)} pairs, "
+            f"pool={','.join(pool_modes)}"
+        )
         t1 = time.time()
-        acts_a = capture_one_side(model, tokenizer, texts_a, device)
-        torch.save(acts_a, out_dir / f"{slug}_a.pt")
+        # Mean-pool stays on the canonical filenames {slug}_a.pt / {slug}_b.pt
+        # for backward compat with 03_similarity.py. Other pool modes get a
+        # suffix so multiple modes can coexist.
+        acts_a = capture_one_side(model, tokenizer, texts_a, device, pool_modes)
+        for mode, t in acts_a.items():
+            suffix = "" if mode == "mean" else f"_{mode}"
+            torch.save(t, out_dir / f"{slug}_a{suffix}.pt")
         del acts_a
 
-        acts_b = capture_one_side(model, tokenizer, texts_b, device)
-        torch.save(acts_b, out_dir / f"{slug}_b.pt")
+        acts_b = capture_one_side(model, tokenizer, texts_b, device, pool_modes)
+        for mode, t in acts_b.items():
+            suffix = "" if mode == "mean" else f"_{mode}"
+            torch.save(t, out_dir / f"{slug}_b{suffix}.pt")
         del acts_b
 
         print(f"[02]   done in {time.time() - t1:.1f}s")
+
+        files = []
+        for mode in pool_modes:
+            suffix = "" if mode == "mean" else f"_{mode}"
+            files.extend([f"{slug}_a{suffix}.pt", f"{slug}_b{suffix}.pt"])
 
         by_slug[slug] = {
             "slug": slug,
@@ -271,7 +323,8 @@ def main() -> None:
             "label": label,
             "n_pairs": len(pairs),
             "ids": ids,
-            "files": [f"{slug}_a.pt", f"{slug}_b.pt"],
+            "pool_modes": pool_modes,
+            "files": files,
         }
 
     # Reorder the manifest's contrasts list to match CONTRAST_SETS so it's

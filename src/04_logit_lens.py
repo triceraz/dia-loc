@@ -1,16 +1,23 @@
-"""Logit lens: per-layer top-1 token agreement between paired residuals.
+"""Logit lens: per-layer top-1 next-token agreement between paired inputs.
 
 For each layer L and each pair (a, b):
-  - Compute logits_a = embed @ a[L]
-  - Compute logits_b = embed @ b[L]
+  - Project the LAST-TOKEN residual through the unembedding to get logits
   - top1_a = argmax(logits_a), top1_b = argmax(logits_b)
   - agreement(L) = mean over pairs of [top1_a == top1_b]
 
-Reads the same activations as 03_similarity.py, plus the model's
-embedding matrix (used as the unembedding via Qwen's tied weights).
-For Qwen 2.5, model.embed_tokens.weight is tied to lm_head.weight, so
-we project residuals through embed_tokens to get the same logits
-lm_head would have produced.
+Reads the `*_last.pt` activations captured by 02 with --pool last.
+These tensors hold the residual at the last real (non-pad) token
+position per layer, which is the canonical autoregressive next-token
+prediction anchor.
+
+Earlier (v0.1) we read mean-pooled residuals here, which produced a
+degenerate ~1.0 agreement everywhere because mean-pooling washes out
+the next-token signal. Last-token is the right granularity.
+
+Reads the model's embedding matrix as the unembedding via Qwen's tied
+weights. For Qwen 2.5, model.embed_tokens.weight is tied to
+lm_head.weight, so projecting residuals through embed_tokens gives
+the same logits lm_head would have produced.
 
 Output:
 
@@ -61,17 +68,67 @@ def get_unembedding(model_id: str) -> torch.Tensor:
     return embed  # [vocab, d_model]
 
 
+def _logits(
+    a_layer: torch.Tensor, embed: torch.Tensor
+) -> torch.Tensor:
+    return a_layer.to(torch.float32) @ embed.t()  # [N, V]
+
+
 def top1_agreement(
-    a_layer: torch.Tensor,  # [N, D]
-    b_layer: torch.Tensor,  # [N, D]
-    embed: torch.Tensor,    # [V, D]
+    a_layer: torch.Tensor, b_layer: torch.Tensor, embed: torch.Tensor
 ) -> float:
-    # Project to logits. We don't softmax; argmax is invariant to it.
-    logits_a = a_layer.to(torch.float32) @ embed.t()  # [N, V]
-    logits_b = b_layer.to(torch.float32) @ embed.t()
-    top_a = logits_a.argmax(dim=-1)
-    top_b = logits_b.argmax(dim=-1)
-    return float((top_a == top_b).float().mean().item())
+    """Fraction of pairs where the argmax token matches.
+
+    Caveat for the BM/NN case: when the input ends with a period, both
+    sides typically argmax onto the same end-of-sentence token, which
+    inflates this number to ~1.0 across layers. We keep it as one
+    signal but pair it with finer-grained metrics below.
+    """
+    la = _logits(a_layer, embed).argmax(dim=-1)
+    lb = _logits(b_layer, embed).argmax(dim=-1)
+    return float((la == lb).float().mean().item())
+
+
+def topk_overlap(
+    a_layer: torch.Tensor, b_layer: torch.Tensor, embed: torch.Tensor, k: int
+) -> float:
+    """Mean Jaccard overlap of the top-K next-token sets.
+
+    k=1 reduces to top1_agreement. Higher k smooths over the trivial
+    "both predict period" case and surfaces whether the *vocabulary
+    region* of the prediction matches.
+    """
+    la = _logits(a_layer, embed).topk(k, dim=-1).indices  # [N, k]
+    lb = _logits(b_layer, embed).topk(k, dim=-1).indices
+    n = la.shape[0]
+    overlaps = torch.zeros(n)
+    for i in range(n):
+        s_a = set(la[i].tolist())
+        s_b = set(lb[i].tolist())
+        union = s_a | s_b
+        inter = s_a & s_b
+        overlaps[i] = len(inter) / len(union) if union else 0.0
+    return float(overlaps.mean().item())
+
+
+def js_divergence(
+    a_layer: torch.Tensor, b_layer: torch.Tensor, embed: torch.Tensor
+) -> float:
+    """Mean Jensen-Shannon divergence (nats) between the two predicted
+    distributions per pair, averaged across pairs.
+
+    JS(P, Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M), M = 0.5 * (P + Q).
+    Symmetric and bounded by ln(2). Captures distribution-level
+    disagreement that top-1 misses.
+    """
+    pa = torch.softmax(_logits(a_layer, embed), dim=-1)  # [N, V]
+    pb = torch.softmax(_logits(b_layer, embed), dim=-1)
+    m = 0.5 * (pa + pb)
+    eps = 1e-12
+    kl_am = (pa * (pa.add(eps).log() - m.add(eps).log())).sum(dim=-1)
+    kl_bm = (pb * (pb.add(eps).log() - m.add(eps).log())).sum(dim=-1)
+    js = 0.5 * (kl_am + kl_bm)
+    return float(js.mean().item())
 
 
 def main() -> None:
@@ -98,10 +155,15 @@ def main() -> None:
 
     for c in contrasts:
         slug = c["slug"]
-        a_path = act_dir / f"{slug}_a.pt"
-        b_path = act_dir / f"{slug}_b.pt"
+        # Last-token tensors are the right input for logit lens. If they
+        # haven't been captured yet, skip with a clear message.
+        a_path = act_dir / f"{slug}_a_last.pt"
+        b_path = act_dir / f"{slug}_b_last.pt"
         if not (a_path.exists() and b_path.exists()):
-            print(f"[04] {slug}: tensors missing, skipping")
+            print(
+                f"[04] {slug}: last-token tensors missing. "
+                f"Run: python src/02_capture_activations.py --pool last"
+            )
             continue
         a = torch.load(a_path, weights_only=True, map_location="cpu")  # [N, L, D]
         b = torch.load(b_path, weights_only=True, map_location="cpu")
@@ -111,31 +173,50 @@ def main() -> None:
         n_pairs, n_layers, _ = a.shape
 
         agreements: list[float] = []
+        topk_overlaps: list[float] = []
+        js_divs: list[float] = []
         for li in range(n_layers):
             agr = top1_agreement(a[:, li, :], b[:, li, :], embed)
+            ov = topk_overlap(a[:, li, :], b[:, li, :], embed, k=10)
+            jsd = js_divergence(a[:, li, :], b[:, li, :], embed)
             agreements.append(agr)
+            topk_overlaps.append(ov)
+            js_divs.append(jsd)
             rows.append({
                 "contrast": slug,
                 "label": c["label"],
                 "layer": li,
                 "n_pairs": n_pairs,
                 "top1_agreement": agr,
+                "top10_jaccard": ov,
+                "js_divergence": jsd,
             })
         per_contrast[slug] = {
             "label": c["label"],
             "n_pairs": n_pairs,
             "top1_agreement": agreements,
+            "top10_jaccard": topk_overlaps,
+            "js_divergence": js_divs,
         }
         print(
             f"[04] {slug:>3}: n={n_pairs:>3}  "
-            f"agr[0]={agreements[0]:.3f}..agr[-1]={agreements[-1]:.3f}"
+            f"top10[0]={topk_overlaps[0]:.3f}..[-1]={topk_overlaps[-1]:.3f}  "
+            f"JS[0]={js_divs[0]:.3f}..[-1]={js_divs[-1]:.3f}"
         )
 
     csv_path = out_dir / "logit_lens.csv"
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["contrast", "label", "layer", "n_pairs", "top1_agreement"],
+            fieldnames=[
+                "contrast",
+                "label",
+                "layer",
+                "n_pairs",
+                "top1_agreement",
+                "top10_jaccard",
+                "js_divergence",
+            ],
         )
         w.writeheader()
         w.writerows(rows)
@@ -159,24 +240,38 @@ def main() -> None:
         return
 
     palette = {"d1": "#d62728", "d2": "#1f77b4", "d3": "#7f7f7f"}
-    fig, ax = plt.subplots(figsize=(7, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2), sharex=True)
     for slug, data in per_contrast.items():
+        color = palette.get(slug)
         layers = list(range(len(data["top1_agreement"])))
-        ax.plot(
-            layers,
-            data["top1_agreement"],
-            "-o",
-            markersize=3,
-            label=slug.upper(),
-            color=palette.get(slug),
+        axes[0].plot(
+            layers, data["top1_agreement"], "-o", markersize=3,
+            label=slug.upper(), color=color,
         )
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("top-1 token agreement")
-    ax.set_title(f"DIA-LOC: logit-lens agreement — {MODEL_ID}")
-    ax.set_ylim(-0.02, 1.02)
-    ax.axhline(1.0, color="black", linewidth=0.5, alpha=0.3)
-    ax.grid(alpha=0.3)
-    ax.legend()
+        axes[1].plot(
+            layers, data["top10_jaccard"], "-o", markersize=3,
+            label=slug.upper(), color=color,
+        )
+        axes[2].plot(
+            layers, data["js_divergence"], "-o", markersize=3,
+            label=slug.upper(), color=color,
+        )
+
+    axes[0].set_title("Top-1 token agreement")
+    axes[0].set_ylabel("agreement")
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[1].set_title("Top-10 Jaccard overlap")
+    axes[1].set_ylabel("overlap")
+    axes[1].set_ylim(-0.02, 1.02)
+    axes[2].set_title("Jensen-Shannon divergence")
+    axes[2].set_ylabel("JS (nats)")
+    for ax in axes:
+        ax.set_xlabel("Layer")
+        ax.grid(alpha=0.3)
+        ax.legend()
+    fig.suptitle(
+        f"DIA-LOC: logit-lens at last-token — {MODEL_ID}"
+    )
     fig.tight_layout()
 
     png_path = fig_dir / "04_logit_lens.png"
