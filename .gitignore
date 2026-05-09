@@ -1,0 +1,26 @@
+# Heavy artifacts — never commit. Released via HF separately.
+runs/
+data/cache/
+*.pt
+*.bin
+*.safetensors
+*.npy
+*.npz
+
+# Local env
+.env
+.env.local
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.python-version
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

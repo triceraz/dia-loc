@@ -1,0 +1,26 @@
+# DIA-LOC: Dialect Localization in Open Norwegian-Capable LLMs
+# Pinned loosely to the latest 2026-stable versions; tighten before paper submission.
+
+# Core ML stack
+torch>=2.4.0
+transformers>=4.46.0
+datasets>=3.0.0
+huggingface_hub>=0.26.0
+
+# Mech-interp tooling (Week 2+)
+transformer-lens>=2.10.0
+
+# Sentence similarity for filtering candidate pairs in D1
+sentence-transformers>=3.2.0
+
+# Linear probes (Week 3)
+scikit-learn>=1.5.0
+
+# Plotting
+matplotlib>=3.9.0
+numpy>=1.26.0
+
+# Utilities
+tqdm>=4.66.0
+requests>=2.32.0
+python-dotenv>=1.0.0
