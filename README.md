@@ -2,103 +2,109 @@
 
 **Localizing Dialect Representation in Open Norwegian-Capable LLMs.**
 
-Where in an instruction-tuned open Norwegian-capable LLM does the Bokmål-Nynorsk
-representational gap live, and does it ride on the same internal machinery as
-the English-vs-Norwegian gap, or on separate dimensions?
+Where in an instruction-tuned open Norwegian-capable LLM does the
+Bokmål-Nynorsk representational gap live, and does it ride on the same
+internal machinery as the English-vs-Norwegian gap, or on separate
+dimensions?
 
-## Status
+Paper draft: [`paper/paper.md`](paper/paper.md)
+Figures: [`paper/figures/`](paper/figures/)
 
-Pre-experimental. Week 1 (data curation) in progress.
+## TL;DR (v0.1)
 
-## Pre-registered hypotheses
+We ran five mech-interp probes on **off-the-shelf Qwen 2.5 1.5B
+Instruct** across three contrast sets:
 
-- **H1 (sparsity).** The BM/NN representational divergence is concentrated in
-  specific layers and a small subset of attention heads, not uniformly distributed.
-- **H2 (entanglement).** The set of dialect-carrying heads is a strict subset of
-  foreign-language-carrying heads. The model treats nynorsk as a kind of mild
-  foreign language.
-- **H2-alt (separation).** The two head sets are disjoint or only weakly overlap.
-  The model treats BM/NN distinction as orthogonal to NB/EN.
+| Set | Contents | Source | n |
+|---|---|---|---|
+| D1 | BM ↔ NN paraphrase | Norwegian Bokmål Wikipedia + Apertium nob→nno | 200 |
+| D2 | NB ↔ EN translation | FLORES-200 nob_Latn / eng_Latn dev | 200 |
+| D3 | BM ↔ BM paraphrase (control) | Norwegian Bokmål Wikipedia + Gemma 3 4B paraphrase | 100 |
 
-## Method
+**Headline finding** (see [`paper/figures/05_linear_probes.png`](paper/figures/05_linear_probes.png)):
 
-Five probes applied to three sentence-pair contrast sets:
+| Contrast | 5-fold CV linear probe accuracy (across 28 layers) |
+|---|---|
+| D2 (NB↔EN) | **1.00** — perfectly linearly separable |
+| D1 (BM↔NN) | **0.77 - 0.82** — small but reliable signal |
+| D3 (BM↔BM control) | 0.68 - 0.70 — surface-variation noise floor |
 
-| Set | Contents                                          | Source                                     | Size |
-|-----|---------------------------------------------------|--------------------------------------------|------|
-| D1  | Paired BM ↔ NN (the dialectal contrast)           | Wikipedia seeds + Apertium nob→nno         | 200  |
-| D2  | Paired NB ↔ EN (the foreign-language contrast)    | FLORES-200 nob_Latn / eng_Latn             | 200  |
-| D3  | Paired BM ↔ BM near-paraphrases (control)         | Wikipedia seeds + LLM paraphrase via Hugin | 100  |
+The dialect signal is **invisible to direct similarity metrics** —
+cosine similarity between paired BM/NN residuals is ~0.98 at every
+layer, geometrically nearly identical. But a linear probe finds a
+small, reliable, distributed-across-the-stack direction that
+distinguishes them. ~10 percentage points above the noise floor at
+every layer.
 
-Probes:
-
-1. Layer-wise cosine similarity between paired residual streams
-2. Layer-wise CKA (kernel-robust alternative)
-3. Logit-lens top-1 token agreement per layer
-4. Linear probe for contrast identity (per layer, per checkpoint)
-5. Attention-head ablation; identify top-K dialect heads and top-K
-   foreign-language heads
-6. *(Stretch)* Sparse autoencoder on the highest-divergence layer; look for
-   features firing only on NN, only on EN, or both
-
-The headline analysis is a comparison of (4)+(5) signatures across D1 vs D2:
-head-set IoU and layer-signature correlation.
-
-## Model
-
-Primary: Qwen 2.5 1.5B Instruct.
-
-Compute: 1× RTX 3060 Ti (8 GB), ~10 GPU-hours total wall-clock.
+That reframes one paper question. "Where does the dialect signal
+live?" presupposes a substantial signal to localize. At this model
+size, off the shelf, the dialect direction is already there from
+input through to output — the model encodes it as a stable linear
+direction, not as a spike at any specific layer.
 
 ## Repo layout
 
 ```
 dia-loc/
-├── README.md
+├── README.md                            (this file)
 ├── requirements.txt
 ├── paper/
-│   ├── paper.md
-│   └── figures/
+│   ├── paper.md                         v0.1 draft
+│   └── figures/                         03 / 04 / 05 / 06 PNGs
 ├── src/
-│   ├── 01_build_contrast_sets.py
-│   ├── 02_capture_activations.py        (Week 2)
-│   ├── 03_similarity.py                 (Week 2)
-│   ├── 04_logit_lens.py                 (Week 2)
-│   ├── 05_linear_probes.py              (Week 3)
-│   ├── 06_attention_ablation.py         (Week 3)
-│   ├── 07_entanglement_comparison.py    (Week 3)
-│   ├── 08_sae_train.py                  (Week 4)
-│   ├── 09_sae_features.py               (Week 4)
-│   └── lib/
-│       ├── hooks.py
-│       ├── config.py
-│       └── eval_set.py
-├── data/                                (curated pairs as JSONL)
-└── runs/                                (gitignored; activations, SAE weights)
+│   ├── 01_build_contrast_sets.py        D1 + D2 + D3 builders
+│   ├── 02_capture_activations.py        forward-hook capture (mean / last pool)
+│   ├── 03_similarity.py                 layer-wise cosine + CKA
+│   ├── 04_logit_lens.py                 top-1 / top-10 / JS at last token
+│   ├── 05_linear_probes.py              5-fold CV LR per layer (the finding)
+│   ├── 06_head_ablation.py              28×12 head ablation × probe
+│   ├── 07_sae_train.py                  small SAE on a chosen layer
+│   └── lib/{config,eval_set,hooks,__init__}.py
+├── data/                                D1, D2, D3 JSONL pair files
+└── runs/                                (gitignored) activations + probe outputs
 ```
 
-## Setup
+## Compute
+
+1× **RTX 3060 Ti**, ~30 minutes wall-clock for the full pipeline
+including head ablation. Single-author, off-the-shelf model weights
+(no fine-tuning). Python 3.12 + torch 2.6.0+cu124.
+
+## Reproduce
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate    # or .venv\Scripts\activate on Windows
+git clone https://github.com/triceraz/dia-loc
+cd dia-loc
+
+py -3.12 -m venv .venv312
+.venv312\Scripts\activate           # Windows
 pip install -r requirements.txt
+
+# D3 needs an LLM for paraphrase generation. Either set up the Tenki
+# MLX tunnel and put the bearer in a local .env, or replace
+# `llm_paraphrase_bm` in 01_build_contrast_sets.py with another OpenAI-
+# compatible endpoint (Ollama, OpenAI, Anthropic). The .env approach:
+#   LLM_BASE_URL=https://mlx.tenki.no/v1
+#   LLM_API_KEY=<bearer>
+#   LLM_MODEL=mlx-community/gemma-3-4b-it-4bit
+
+python src/01_build_contrast_sets.py
+python src/02_capture_activations.py
+python src/03_similarity.py
+python src/04_logit_lens.py
+python src/05_linear_probes.py
+python src/06_head_ablation.py --limit 30 --contrast d1
+python src/07_sae_train.py --layer 14
 ```
 
-Environment for D3 (LLM paraphrase via the Tenki MLX tunnel):
+## Status
 
-```bash
-export LLM_BASE_URL=https://mlx.tenki.no/v1
-export LLM_API_KEY=<your-bearer-from-tenki-env>
-export LLM_MODEL=mlx-community/gemma-3-4b-it-4bit
-```
-
-## Reproducibility
-
-Every artifact in this paper is produced on a single 3060 Ti from off-the-shelf
-weights and public corpora. No fine-tuning is required to reproduce any result.
-HF: `Triceraz/dia-loc-activations` (residual tensors + SAE weights, ~5 GB).
-GitHub: `Triceraz/dia-loc` (code).
+- v0.1 ships §4.1-4.3 + §4.5 results + §4.4 head ablation (in
+  flight). See [`paper/paper.md`](paper/paper.md) for the writeup.
+- v0.2 (planned): pre-/post-BNCR comparison once a BNCR-trained
+  Qwen 2.5 checkpoint is accessible.
+- v0.3 (stretch): per-token activation capture, proper SAE training
+  (~25k samples), Gemma 3 4B replication.
 
 ## Author
 

@@ -155,7 +155,9 @@ the top-K differential-feature sets across D1, D2, D3 (Jaccard IoU).
 
 ### 4.1 Geometric similarity (P1, P2)
 
-(See `paper/figures/03_similarity.png`.) D1 paired residuals are
+![Layer-wise cosine + CKA per contrast](figures/03_similarity.png)
+
+D1 paired residuals are
 ~0.98 cosine similar at every layer, decreasing in CKA from 0.95 to
 0.90. D2 (NB↔EN) is the clear outlier at ~0.69 cosine and 0.57→0.43
 CKA. **D3 (BM↔BM control) sits BELOW D1** at ~0.95 cosine and
@@ -171,7 +173,9 @@ that surface-token overlap dominates the metric". Need a probe.
 
 ### 4.2 Logit lens (P3)
 
-(See `paper/figures/04_logit_lens.png`.) Top-1 next-token agreement
+![Logit-lens metrics per layer](figures/04_logit_lens.png)
+
+Top-1 next-token agreement
 is near 1.0 for all three contrasts at every layer — the trivial
 collapse onto sentence-final punctuation. Top-10 Jaccard overlap
 recovers the same ordering as cosine: D1 (0.94→0.86) > D3
@@ -187,7 +191,9 @@ logit lens alone.
 
 ### 4.3 Linear probes (P4) — the headline finding
 
-(See `paper/figures/05_linear_probes.png`.) Per-layer 5-fold CV
+![Per-layer linear-probe accuracy](figures/05_linear_probes.png)
+
+Per-layer 5-fold CV
 linear probe accuracy:
 
 - **D2 (NB↔EN)**: 1.00 across all 28 layers. Foreign-language
