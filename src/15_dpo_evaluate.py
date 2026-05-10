@@ -204,13 +204,16 @@ def main() -> None:
         evaluate_checkpoint("base", None, rows, tokenizer, base_model, device)
     )
 
-    for variant in ("targeted", "full"):
-        adapter = runs_dir / variant
-        if not (adapter / "adapter_model.safetensors").exists():
-            print(f"[15] {variant} adapter missing at {adapter}, skipping")
-            continue
+    # Auto-discover every trained adapter under runs/dpo/.
+    discovered: list[Path] = sorted(
+        d for d in runs_dir.iterdir()
+        if d.is_dir() and (d / "adapter_model.safetensors").exists()
+    )
+    for adapter in discovered:
         results.append(
-            evaluate_checkpoint(variant, adapter, rows, tokenizer, base_model, device)
+            evaluate_checkpoint(
+                adapter.name, adapter, rows, tokenizer, base_model, device
+            )
         )
 
     out = REPO_ROOT / "runs" / "dpo" / "evaluation.json"

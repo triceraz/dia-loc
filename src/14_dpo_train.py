@@ -44,14 +44,25 @@ from trl import DPOConfig, DPOTrainer
 from lib.config import DATA_DIR, MODEL_ID, REPO_ROOT
 
 
-# Layers with strongest BM/NN consolidation in Qwen 2.5 1.5B per
-# DIA-LOC §4.6 (50% transfer L21, 90% transfer L26).
-TARGETED_LAYERS = [21, 22, 23, 24, 25, 26]
+# Named sliding-window layer ranges for the v0.5 layer-localization
+# sweep. Each window is 6 contiguous layers so trainable-param counts
+# stay comparable across variants. Only `full` differs in capacity.
+LAYER_WINDOWS: dict[str, list[int]] = {
+    "full": [],  # special: means "all layers" (no layers_to_transform)
+    "early": [0, 1, 2, 3, 4, 5],
+    "earlymid": [7, 8, 9, 10, 11, 12],
+    "mid": [14, 15, 16, 17, 18, 19],
+    "targeted": [21, 22, 23, 24, 25, 26],  # DIA-LOC consolidation band
+}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", choices=("full", "targeted"), required=True)
+    parser.add_argument(
+        "--variant",
+        choices=tuple(LAYER_WINDOWS.keys()),
+        required=True,
+    )
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--beta", type=float, default=0.1)
@@ -86,8 +97,9 @@ def main() -> None:
         "task_type": "CAUSAL_LM",
         "bias": "none",
     }
-    if args.variant == "targeted":
-        lora_kwargs["layers_to_transform"] = TARGETED_LAYERS
+    layer_window = LAYER_WINDOWS[args.variant]
+    if layer_window:
+        lora_kwargs["layers_to_transform"] = layer_window
         # peft requires us to also pass the layer pattern so it knows
         # which Modules constitute a "layer" for indexing. For Qwen 2.5
         # the per-layer container is at model.model.layers.{i}.
@@ -160,9 +172,7 @@ def main() -> None:
         "lora_r": 16,
         "lora_alpha": 32,
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "layers_to_transform": (
-            TARGETED_LAYERS if args.variant == "targeted" else None
-        ),
+        "layers_to_transform": layer_window or None,
         "n_train": len(raw),
     }
     (out_dir / "training_meta.json").write_text(
