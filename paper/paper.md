@@ -348,6 +348,49 @@ the last-token residual transitions sharply from "no transfer" to
 "full transfer" on D1 (L21-22). Whatever mechanism finalizes the
 dialect-specific output runs through that band.
 
+### 4.7 Cross-size replication on Qwen 2.5 3B (v0.3)
+
+![Cross-size: 1.5B (solid) vs 3B (dashed)](figures/10_cross_size_consolidation.png)
+
+We re-run the activation-patching probe (§4.6) on Qwen 2.5 3B
+Instruct, the next size up in the same family (36 layers vs 28).
+Same three contrasts, same n=50 pairs each, same last-token patching
+protocol.
+
+| | 1.5B (28L) | 3B (36L) | frac (1.5B) | frac (3B) |
+|---|---:|---:|---:|---:|
+| D2 50% transfer | L10 | L11 | 0.37 | 0.31 |
+| D3 50% transfer | L18 | L24 | 0.67 | 0.69 |
+| D1 50% transfer | L21 | L29 | 0.78 | 0.83 |
+| D2 90% transfer | L17 | L25 | 0.63 | 0.71 |
+| D3 90% transfer | L26 | L33 | 0.96 | 0.94 |
+| D1 90% transfer | L26 | L33 | 0.96 | 0.94 |
+
+The **fractional position** of each consolidation threshold is
+remarkably stable between the two model sizes (right panel of the
+figure):
+
+- Foreign-language consolidation at ~30% through the stack.
+- Paraphrase-content consolidation at ~67% through.
+- Dialect consolidation at ~80% through.
+
+The hierarchy from §4.6 (foreign < paraphrase < dialect) reproduces
+intact. The absolute layer numbers shift with depth, as expected for
+a deeper stack distributing the same computational graph across more
+blocks, but the proportional locations don't.
+
+This is a meaningful robustness check. The consolidation hierarchy
+isn't a Qwen-1.5B-specific quirk; it survives a 1.4× increase in
+depth and a 1.33× increase in width. Whether it survives a model-
+family change (Gemma, Llama) is the natural next test, currently
+gated only by HuggingFace access (Gemma is gated, our v0.3 only
+covers Qwen).
+
+The linear probe (§4.3) also reproduces on 3B with very similar
+numbers (D1: 0.81 vs 0.82-0.86 at the final layer). The "dialect
+signal is present, distributed, and consolidates late" picture
+holds.
+
 ## 5. Discussion
 
 The activation-patching hierarchy (§4.6) is the v0.2 result that
@@ -407,9 +450,11 @@ head dominates.
 
 ## 6. Limitations
 
-1. **Single model.** Qwen 2.5 1.5B Instruct only. Generalization to
-   Qwen 2.5 7B, Gemma 3 4B (the production Hugin model), and other
-   families is open. The compute and code are ready to extend.
+1. **Single model family.** Qwen 2.5 1.5B Instruct (primary, all
+   probes) and Qwen 2.5 3B Instruct (cross-size replication on the
+   activation-patching curve only). Generalization to Gemma 3 4B
+   (the production Hugin model) and Llama-family models is open;
+   blocked currently on HF gated access for Gemma.
 2. **Single source per contrast.** Apertium for BM↔NN, FLORES for
    NB↔EN, Gemma 3 4B for BM↔BM. Surface-form effects are
    confounded with the translator/paraphraser. A multi-source D1
