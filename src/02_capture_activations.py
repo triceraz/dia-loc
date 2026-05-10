@@ -126,6 +126,73 @@ def _pool_layer_outputs(
 
 
 @torch.no_grad()
+def capture_per_token(
+    model,
+    tokenizer,
+    texts: list[str],
+    device: str,
+    layers: list[int],
+) -> tuple[dict[int, torch.Tensor], list[dict]]:
+    """Capture per-token residuals at SPECIFIC layers, flattened.
+
+    For each text, runs forward, captures residual at each requested
+    layer for every real token, and returns:
+
+      acts_by_layer: {layer_idx: [total_tokens, d_model] fp16 tensor}
+      meta:          list of per-row dicts with input_idx, position,
+                     and length-of-source-input
+
+    SAE training reads the flat tensor; differential analysis groups
+    rows by input_idx via the meta list.
+    """
+    n_layers = num_layers(model)
+    for li in layers:
+        if not (0 <= li < n_layers):
+            raise ValueError(f"layer {li} out of range [0, {n_layers})")
+
+    rows_by_layer: dict[int, list[torch.Tensor]] = {li: [] for li in layers}
+    # Meta is shared across layers — same (input_idx, position) ordering
+    # per layer's flat tensor since all layers see the same inputs.
+    meta: list[dict] = []
+
+    for input_idx, text in enumerate(tqdm(texts, desc="forward (per-token)", leave=False)):
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_TOKENS,
+            padding=False,
+        )
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        seq_len = int(attention_mask.sum().item())
+
+        out: dict[int, torch.Tensor] = {}
+        with capture_residuals(model, out):
+            model(input_ids=input_ids, attention_mask=attention_mask)
+
+        for li in layers:
+            h = out[li].to(torch.float32)  # [1, S, D]
+            # padding=False, so slicing to seq_len is exact.
+            real = h[0, :seq_len, :].to(torch.float16).cpu()  # [seq_len, D]
+            rows_by_layer[li].append(real)
+
+        for pos in range(seq_len):
+            meta.append({
+                "input_idx": input_idx,
+                "position": pos,
+                "input_seq_len": seq_len,
+            })
+
+    # Concatenate per-layer rows into a single flat tensor.
+    acts_by_layer = {
+        li: torch.cat(rows_by_layer[li], dim=0) if rows_by_layer[li] else torch.empty(0, num_layers(model))
+        for li in layers
+    }
+    return acts_by_layer, meta
+
+
+@torch.no_grad()
 def capture_one_side(
     model,
     tokenizer,
@@ -202,6 +269,16 @@ def main() -> None:
             "captures both since the marginal cost is tiny."
         ),
     )
+    parser.add_argument(
+        "--per-token-layers",
+        default="",
+        help=(
+            "Comma-separated layer indices to ALSO save per-token "
+            "activations for (e.g. '20' or '0,14,27'). Each chosen layer "
+            "produces a flat [total_tokens, d_model] tensor + meta JSON "
+            "for SAE training and per-token analysis. Skipped when empty."
+        ),
+    )
     args = parser.parse_args()
 
     if args.contrasts:
@@ -213,6 +290,12 @@ def main() -> None:
     for m in pool_modes:
         if m not in POOL_MODES:
             sys.exit(f"unknown pool mode: {m}; expected {POOL_MODES}")
+
+    per_token_layers: list[int] = []
+    if args.per_token_layers:
+        per_token_layers = [
+            int(x.strip()) for x in args.per_token_layers.split(",") if x.strip()
+        ]
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _resolve_dtype(DTYPE_NAME)
@@ -316,6 +399,29 @@ def main() -> None:
             suffix = "" if mode == "mean" else f"_{mode}"
             files.extend([f"{slug}_a{suffix}.pt", f"{slug}_b{suffix}.pt"])
 
+        # Optional per-token capture for SAE training + non-final-position
+        # logit lens. One flat [total_tokens, d_model] tensor + meta JSON
+        # per (side, layer).
+        if per_token_layers:
+            for side, texts_side in (("a", texts_a), ("b", texts_b)):
+                acts_by_layer, meta = capture_per_token(
+                    model, tokenizer, texts_side, device, per_token_layers,
+                )
+                for li, t in acts_by_layer.items():
+                    pt_path = out_dir / f"{slug}_{side}_l{li:02d}_pertoken.pt"
+                    torch.save(t, pt_path)
+                    files.append(pt_path.name)
+                meta_path = out_dir / f"{slug}_{side}_pertoken_meta.json"
+                meta_path.write_text(
+                    json.dumps(meta, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                files.append(meta_path.name)
+            print(
+                f"[02]   per-token: layers={per_token_layers} "
+                f"({sum(t.shape[0] for t in acts_by_layer.values())} tokens/side)"
+            )
+
         by_slug[slug] = {
             "slug": slug,
             "lang_a": lang_a,
@@ -324,6 +430,7 @@ def main() -> None:
             "n_pairs": len(pairs),
             "ids": ids,
             "pool_modes": pool_modes,
+            "per_token_layers": per_token_layers,
             "files": files,
         }
 
