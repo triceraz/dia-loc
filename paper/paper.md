@@ -259,21 +259,120 @@ dialect-carrying heads are a strict subset of foreign-language-
 carrying heads) is therefore moot at the head-granularity in this
 model: there is no concentrated "dialect head set" to compare against.
 
-### 4.5 SAE (stretch)
+### 4.5 SAE (v0.2: per-token, 36k training samples)
 
-(See `runs/probes/sae_layer14.json`.) The SAE at layer 14 produces
-top-50 differential-feature sets with high cross-contrast IoU
-(D1↔D2: 0.667, D1↔D3: 0.639, D2↔D3: 0.695). At this scale (1,000
-training samples on 12,288 features) the SAE is severely
-undertrained relative to canonical recipes (millions of tokens).
-The high IoU is most consistent with "these are 'any-input-deviation'
-features, not dialect-/language-specific features".
+![Top-K differential-feature IoU between contrasts (SAE layer 20)](figures/07_sae_iou_layer20.png)
 
-**Limitation.** A production-quality SAE for this question needs
-per-token activations at scale (~25k samples) and longer training.
-Deferred to v2.
+We train a small ReLU SAE (decoder columns kept unit-norm; encoder
+1536 → 12288 with bias) at residual layer 20 on the per-token
+activations captured by `02 --per-token-layers 20`. Training set:
+36,269 token-level activations across D1, D2, and D3 (vs the v0.1
+mean-pooled 1,000 samples — 36× larger). 30 epochs of mini-batch
+AdamW (batch 512, lr 3e-4, L1 weight 5e-3).
+
+For each contrast we then aggregate per-input feature activations
+(mean across the input's tokens, then mean across inputs per side)
+and rank features by the absolute side-difference. Two summaries:
+
+| Contrast | max\|a-b\| | mean\|a-b\| |
+|---|---:|---:|
+| D1 (BM↔NN)  | 0.50 | 0.039 |
+| D2 (NB↔EN)  | 8.25 | 0.535 |
+| D3 (BM↔BM)  | 1.47 | 0.098 |
+
+D2's differential SAE response is **~13× larger** than D1's, which
+matches the linear probe's ranking: NB↔EN is mechanistically
+distinguished much more strongly than BM↔NN even at layer 20.
+
+Top-K differential-feature IoU at K=100 across contrasts:
+
+| Pair | IoU |
+|---|---:|
+| D1 vs D2 | 0.754 |
+| D1 vs D3 | 0.695 |
+| D2 vs D3 | 0.770 |
+
+The high cross-contrast IoU (0.69-0.77) reproduces the v0.1 finding
+on much firmer ground: **the top differential features are mostly
+shared across contrasts**, suggesting they are general
+"input-deviation" features rather than sparse, dialect- or
+language-specific features. At least at layer 20, with this SAE
+recipe, no clean "dialect feature" or "Norwegian feature" jumps out
+of the codebook.
+
+### 4.6 Activation patching (v0.2: where does each contrast commit?)
+
+![Per-contrast last-token transfer per layer](figures/08_activation_patching_combined.png)
+
+For each contrast we run a clean forward on `text_a` and `text_b`,
+capturing each block's output residual. Then for each layer L we
+re-run `text_a` with a forward hook on block L that REPLACES only
+the LAST-TOKEN position of the residual stream with B's last-token
+residual at the same layer; other positions retain A's processing.
+The transfer fraction at L is
+
+  T(L) = 1 - KL( p_{a,patched}(L) || p_b ) / KL( p_a || p_b )
+
+T(L) = 0 means patching at L did nothing; T(L) = 1 means the patched
+A run reproduces clean B's predictions. n=50 pairs per contrast.
+
+The headline finding is a hierarchy of representational commitment:
+
+| Contrast | First L with T ≥ 0.5 | First L with T ≥ 0.9 | baseline KL(A‖B) |
+|---|---:|---:|---:|
+| D2 (NB↔EN, foreign-language) | **L10** | L17 | 4.54 nats |
+| D3 (BM↔BM, paraphrase) | **L18** | L26 | 1.08 nats |
+| D1 (BM↔NN, dialectal) | **L21** | L26 | 0.15 nats |
+
+In words: in this off-the-shelf Qwen 2.5 1.5B,
+
+- **Foreign-language commitment** in the last-token residual happens
+  in the early-mid stack (~L10-17). By layer 17, replacing the
+  last-token residual with the English version is enough to make
+  the model predict like the English run.
+- **Same-language paraphrase commitment** happens in mid-stack
+  (~L18). At L18 replacing the last-token residual with the
+  paraphrased BM run carries 50% of the prediction.
+- **Dialect commitment** is the latest of the three (~L21-26). The
+  BM/NN distinction in the last-token residual is finalized in the
+  last 6-7 layers of the stack.
+
+This is the cleanest mechanistic finding of the paper. The three
+contrasts probe distinct levels of a representational hierarchy in
+the same model: language identity is decided early, lexical content
+middle, dialect identity late.
+
+It also coheres with the head-ablation negative result. There is
+no single "dialect head", but there IS a **range of layers** where
+the last-token residual transitions sharply from "no transfer" to
+"full transfer" on D1 (L21-22). Whatever mechanism finalizes the
+dialect-specific output runs through that band.
 
 ## 5. Discussion
+
+The activation-patching hierarchy (§4.6) is the v0.2 result that
+binds the rest of the paper together. The three contrasts each
+"commit" at a different layer band: foreign-language identity at
+~L10-17, paraphrase content at ~L18-26, dialect identity at
+~L21-26. At the granularity of the last-token residual, the model
+treats these as a layered hierarchy of decisions, not as
+parallel-but-similar tasks.
+
+Three pieces of evidence converge on the same picture for D1:
+- Linear probe (§4.3): dialect identity is detectable at every layer
+  (~0.80 accuracy), so the signal is **present** throughout.
+- Head ablation (§4.4): no individual head dominates, so the signal
+  is **distributed**, not localized.
+- Activation patching (§4.6): the prediction-anchor (last-token
+  residual) transfers from BM to NN sharply between L21 and L26,
+  so the signal is **consolidated** late.
+
+"Distributed signal that consolidates late" is mech-interp specific
+language for: BM/NN distinction sits in many places early on, but
+the model only commits to a dialect-specific output direction in
+the last 6-7 layers. That's the answer to "where does dialect
+live in the residual stream?". Not in any one head, but as a
+late-stack commitment of a long-distributed signal.
 
 The output-vs-internal distinction we set out to test asks: when
 BNCR closes the BM/NN gap on outputs, is it because the
